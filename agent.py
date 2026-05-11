@@ -36,14 +36,11 @@ tenant = os.environ.get("CHROMA_TENANT")
 database = os.environ.get("CHROMA_DATABASE")
 chroma_api_key = os.environ.get("CHROMA_API_KEY")
 
-# embedding model via HuggingFace Inference API (no local model weights)
-# Uses HuggingFaceEndpointEmbeddings — the current, non-deprecated API class.
-# bge-base-en-v1.5 is served at the dedicated HF feature-extraction endpoint.
+# embedding model via HuggingFace Inference API (no local model weights, ~0 MB RAM)
 EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
-HF_INFERENCE_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-base-en-v1.5"
 hf_token = os.environ.get("HF_TOKEN")
 inference_embeddings = HuggingFaceEndpointEmbeddings(
-    model=HF_INFERENCE_URL,
+    repo_id=EMBEDDING_MODEL,
     huggingfacehub_api_token=hf_token,
 )
 
