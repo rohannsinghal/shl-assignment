@@ -563,24 +563,22 @@ def _hybrid_personality_query(messages: List[Dict[str, str]]) -> str | None:
     return None
 # ──────────────────────────────────────────────────────────────────────────────
 
-# ── BUG 2 FIX: Deterministic prior shortlist extractor ────────────────────────
-# DESIGN:
-#   The API response has both `reply` (str) and `recommendations` (list).
-#   Clients echo back only the `reply` text as the assistant's `content` field.
-#   So we EMBED the shortlist as a hidden machine-readable footer in the reply text:
-#       \n\n<!--RECS:[ ... JSON ... ]-->
-#   This footer is invisible to end-users but is reliably extractable here.
-#   The generator system prompt is also told to ignore the footer.
+# ── Prior shortlist extractor ─────────────────────────────────────────────────
+# DESIGN (v3 — structured field, no text hacks):
+#
+#   The API returns {"reply": str, "recommendations": [...], "end_of_conversation": bool}.
+#   When clients echo assistant turns back they send:
+#       {"role": "assistant", "content": "<reply text>", "recommendations": [...]}
+#   We accept `recommendations` as an Optional field on MessageItem (see below)
+#   and preserve it through chat_endpoint so the extractor finds it here.
+#
+#   Fallback chain for older / plain-text clients:
+#     1. Explicit `recommendations` key on the assistant message dict  ← new primary
+#     2. "recommendations": [...] block embedded in content text       ← legacy
+#     3. Bare [{name, url, ...}] array in content text                 ← last resort
 
 import re as _re
 
-# Primary pattern: our own hidden footer (most reliable)
-_FOOTER_PATTERN = _re.compile(
-    r'<!--RECS:(\[.*?\])-->',
-    _re.DOTALL,
-)
-
-# Legacy / fallback patterns for messages without the footer
 _RECS_JSON_PATTERN = _re.compile(
     r'"recommendations"\s*:\s*(\[.*?\])',
     _re.DOTALL,
@@ -590,80 +588,41 @@ _BARE_ARRAY_PATTERN = _re.compile(
     _re.DOTALL,
 )
 
-# Sentinel used to embed / strip the footer
-_RECS_FOOTER_PREFIX = "\n\n<!--RECS:"
-_RECS_FOOTER_SUFFIX = "-->"
 
-
-def _embed_recs_footer(reply_text: str, recommendations: List[Dict[str, Any]]) -> str:
-    """
-    Append a hidden machine-readable footer to the reply text so that
-    future turns can reliably extract the most-recent shortlist from the
-    assistant message content alone, without relying on the LLM.
-    Only appended when recommendations is non-empty.
-    """
-    if not recommendations:
-        return reply_text
-    try:
-        recs_json = json.dumps(recommendations, separators=(",", ":"))
-        return f"{reply_text}{_RECS_FOOTER_PREFIX}{recs_json}{_RECS_FOOTER_SUFFIX}"
-    except Exception:
-        return reply_text
-
-
-def _strip_recs_footer(text: str) -> str:
-    """Remove the hidden footer before presenting the reply to the user."""
-    idx = text.find(_RECS_FOOTER_PREFIX)
-    if idx != -1:
-        return text[:idx]
-    return text
-
-
-def _extract_prior_recommendations_json(messages: List[Dict[str, str]]) -> str:
+def _extract_prior_recommendations_json(messages: List[Dict[str, Any]]) -> str:
     """
     Scan assistant messages in reverse-chronological order and return the JSON
-    string of the most recent non-empty recommendations array found.
-
-    Priority:
-      1. Hidden <!--RECS:[...]-->  footer  (injected by _embed_recs_footer)
-      2. "recommendations": [...]  block   (legacy / LLM-generated JSON responses)
-      3. Bare JSON array with name+url     (last-resort heuristic)
-
+    string of the most recent non-empty recommendations array.
     Returns '[]' when nothing is found.
     """
     for msg in reversed(messages):
         if msg.get("role") != "assistant":
             continue
+
+        # 1. Structured field — set by chat_endpoint when client echoes recs back
+        recs_field = msg.get("recommendations")
+        if recs_field and isinstance(recs_field, list):
+            try:
+                return json.dumps(recs_field)
+            except Exception:
+                pass
+
+        # 2. Embedded JSON in content  (client echoes full response as content)
         content = msg.get("content", "")
-
-        # 1. Hidden footer — most reliable
-        m = _FOOTER_PATTERN.search(content)
+        m = _RECS_JSON_PATTERN.search(content)
         if m:
-            candidate = m.group(1).strip()
             try:
-                parsed = json.loads(candidate)
+                parsed = json.loads(m.group(1).strip())
                 if isinstance(parsed, list) and parsed:
                     return json.dumps(parsed)
             except json.JSONDecodeError:
                 pass
 
-        # 2. "recommendations": [...] key  (e.g. if client echoes raw JSON)
-        m2 = _RECS_JSON_PATTERN.search(content)
+        # 3. Bare array heuristic
+        m2 = _BARE_ARRAY_PATTERN.search(content)
         if m2:
-            candidate = m2.group(1).strip()
             try:
-                parsed = json.loads(candidate)
-                if isinstance(parsed, list) and parsed:
-                    return json.dumps(parsed)
-            except json.JSONDecodeError:
-                pass
-
-        # 3. Bare JSON array with name+url
-        m3 = _BARE_ARRAY_PATTERN.search(content)
-        if m3:
-            candidate = m3.group(1).strip()
-            try:
-                parsed = json.loads(candidate)
+                parsed = json.loads(m2.group(1).strip())
                 if isinstance(parsed, list) and parsed:
                     return json.dumps(parsed)
             except json.JSONDecodeError:
@@ -964,9 +923,6 @@ class SHLAgent:
         lc_messages = [SystemMessage(content=full_system)]
         for msg in state["messages"]:
             role, content = msg.get("role", "user"), msg.get("content", "")
-            # Strip hidden footer from assistant messages so the LLM sees clean text
-            if role == "assistant":
-                content = _strip_recs_footer(content)
             lc_messages.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
 
         try:
@@ -1016,17 +972,8 @@ class SHLAgent:
         if lang_flag:
             safe_recs = []
 
-        # ── Embed hidden footer so future turns can extract the shortlist ──────
-        # The footer <!--RECS:[...]-->  is appended to the reply text and stripped
-        # at the API boundary before returning to the client.  This is the
-        # authoritative source for _extract_prior_recommendations_json.
-        reply_with_footer = _embed_recs_footer(
-            result.reply,
-            [r.model_dump() for r in safe_recs],
-        )
-
         final = FinalOutput(
-            reply=reply_with_footer,    # footer stripped at API layer
+            reply=result.reply,
             recommendations=safe_recs,
             end_of_conversation=result.end_of_conversation,
         )
@@ -1086,6 +1033,10 @@ except Exception as e:
 class MessageItem(BaseModel):
     role: Literal["user", "assistant"]
     content: str
+    # Accept the recommendations array that clients echo back from the previous
+    # API response.  Pydantic would silently drop it without this field.
+    # The extractor uses this as its primary (most reliable) source of prior state.
+    recommendations: Any = None
 
 class ChatRequest(BaseModel):
     messages: List[MessageItem] = Field(..., min_length=1)
@@ -1106,7 +1057,22 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     if agent is None:
         raise HTTPException(status_code=503, detail="Agent not available — check server logs.")
 
-    messages = [{"role": m.role, "content": m.content} for m in request.messages]
+    # Preserve the recommendations field if the client echoes it back.
+    # This is the primary mechanism for _extract_prior_recommendations_json
+    # to find the prior shortlist — no text-hacking or footer tricks needed.
+    messages: List[Dict[str, Any]] = []
+    for m in request.messages:
+        msg: Dict[str, Any] = {"role": m.role, "content": m.content}
+        if m.recommendations is not None:
+            # Normalise to a plain list-of-dicts regardless of what the client sent
+            recs = m.recommendations
+            if isinstance(recs, list) and recs:
+                # Items may arrive as Pydantic models or plain dicts
+                msg["recommendations"] = [
+                    r.model_dump() if hasattr(r, "model_dump") else dict(r)
+                    for r in recs
+                ]
+        messages.append(msg)
 
     # Enforce 8-turn cap
     if len(messages) > 8:
@@ -1121,10 +1087,6 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=500, detail="Internal error. Please retry.")
 
     try:
-        # Strip the hidden <!--RECS:...-->  footer from the reply before returning
-        # to the client.  The footer is only used internally by _extract_prior_recommendations_json
-        # so the conversation history can carry shortlists across turns without relying on the LLM.
-        response_dict["reply"] = _strip_recs_footer(response_dict.get("reply", ""))
         return ChatResponse(**response_dict)
     except Exception:
         return ChatResponse(
