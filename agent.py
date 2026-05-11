@@ -87,6 +87,65 @@ NON_ENGLISH_SIGNALS = [
     "assessed in", "tested in", "evaluate in",
 ]
 
+# ── FIX: BUG 1 — JD Dump detector ────────────────────────────────────────────
+# Distinct technical skill tokens that count toward the 5-skill threshold.
+# Kept conservative: only unambiguous technical nouns / frameworks.
+_JD_SKILL_TOKENS = [
+    "python", "java", "javascript", "typescript", "go", "golang", "rust", "kotlin",
+    "scala", "ruby", "php", "c#", "c++", "swift", "dart",
+    "django", "flask", "fastapi", "spring", "rails", "laravel", "express", "nextjs",
+    "react", "angular", "vue", "svelte",
+    "postgresql", "mysql", "mongodb", "redis", "elasticsearch", "cassandra", "dynamodb",
+    "aws", "azure", "gcp", "docker", "kubernetes", "terraform", "ansible",
+    "kafka", "rabbitmq", "celery",
+    "linux", "bash", "powershell",
+    "microservices", "graphql", "rest", "grpc",
+    "spark", "hadoop", "airflow", "dbt",
+    "sql", "nosql",
+]
+
+def _count_distinct_skills(text: str) -> int:
+    """Return the number of distinct technical skill tokens found in text."""
+    lower = text.lower()
+    return sum(1 for tok in _JD_SKILL_TOKENS if tok in lower)
+
+
+def _is_jd_dump(messages: List[Dict[str, str]]) -> bool:
+    """
+    Returns True when the latest user message looks like a JD dump:
+    5 or more distinct technical skill areas mentioned.
+    Only checks the CURRENT (last) user message to avoid false positives
+    on accumulated conversation history.
+    """
+    last_user = next(
+        (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"), ""
+    )
+    return _count_distinct_skills(last_user) >= 5
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── FIX: BUG 3 — CXO / Executive seniority heuristic ─────────────────────────
+_CXO_TITLES = [
+    "ceo", "coo", "cfo", "cto", "ciso", "cpo", "cmo", "chief ",
+    "chief executive", "chief operating", "chief financial", "chief technology",
+    "chief information", "chief marketing", "chief product",
+    "executive vice president", "evp", "svp", "senior vice president",
+    "managing director", "c-suite", "c suite", "csuite",
+]
+
+_CXO_KEYWORDS = [
+    "OPQ32r", "OPQ Leadership Report", "OPQ UCR 2.0",
+    "leadership", "executive", "senior leadership",
+    "personality", "management", "CXO",
+]
+
+def _is_cxo_query(messages: List[Dict[str, str]]) -> bool:
+    """Returns True when the latest user message mentions a C-suite / executive title."""
+    last_user = next(
+        (m.get("content", "").lower() for m in reversed(messages) if m.get("role") == "user"), ""
+    )
+    return any(title in last_user for title in _CXO_TITLES)
+# ──────────────────────────────────────────────────────────────────────────────
+
 def _needs_language_clarification(messages: List[Dict[str, str]], docs: List[Dict[str, Any]]) -> bool:
     """
     Returns True when:
@@ -504,6 +563,102 @@ def _hybrid_personality_query(messages: List[Dict[str, str]]) -> str | None:
     return None
 # ──────────────────────────────────────────────────────────────────────────────
 
+# ── BUG 2 FIX: Deterministic prior shortlist extractor ────────────────────────
+# The LLM-based classifier sometimes fails to extract the prior shortlist from
+# conversation history (it returns "[]" when it should carry forward items).
+# This function provides a reliable Python-layer fallback that scans all
+# assistant messages for embedded JSON arrays of AssessmentItems.
+
+import re as _re
+
+_RECS_JSON_PATTERN = _re.compile(
+    r'"recommendations"\s*:\s*(\[.*?\])',
+    _re.DOTALL,
+)
+_BARE_ARRAY_PATTERN = _re.compile(
+    r'(\[\s*\{[^]]*"name"\s*:[^]]*"url"\s*:[^]]*\}\s*\])',
+    _re.DOTALL,
+)
+
+
+def _extract_prior_recommendations_json(messages: List[Dict[str, str]]) -> str:
+    """
+    Scan assistant messages in reverse-chronological order and return the JSON
+    string of the most recent non-empty recommendations array found.
+    Returns '[]' when nothing is found.
+    """
+    for msg in reversed(messages):
+        if msg.get("role") != "assistant":
+            continue
+        content = msg.get("content", "")
+
+        # Try to find a "recommendations": [...] block first
+        m = _RECS_JSON_PATTERN.search(content)
+        if m:
+            candidate = m.group(1).strip()
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list) and parsed:
+                    return json.dumps(parsed)
+            except json.JSONDecodeError:
+                pass
+
+        # Fallback: look for a bare JSON array with name+url keys
+        m2 = _BARE_ARRAY_PATTERN.search(content)
+        if m2:
+            candidate = m2.group(1).strip()
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list) and parsed:
+                    return json.dumps(parsed)
+            except json.JSONDecodeError:
+                pass
+
+    return "[]"
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── FIX: BUG 4 — Compound query sub-query generator ───────────────────────────
+# Maps high-level assessment category mentions in user messages → anchored sub-queries.
+# Each sub-query is run as a separate vector search so all categories surface in retrieval.
+_COMPOUND_CATEGORY_SIGNALS: List[tuple[str, str]] = [
+    # (signal substring to detect in last user message, sub-query to add)
+    ("cognitive",          "cognitive ability numerical verbal reasoning Verify"),
+    ("numerical reasoning","numerical reasoning cognitive Verify"),
+    ("verbal reasoning",   "verbal reasoning cognitive Verify"),
+    ("aptitude",           "cognitive ability aptitude reasoning Verify"),
+    ("personality",        "personality questionnaire OPQ32r behaviour"),
+    ("situational",        "situational judgement SJT Graduate Scenarios"),
+    ("sjt",                "situational judgement SJT Graduate Scenarios"),
+    ("simulation",         "simulation assessment role-play"),
+    ("knowledge",          "knowledge test skills technical"),
+    ("leadership",         "leadership executive OPQ Leadership Report"),
+    ("sales",              "sales personality OPQ MQ Sales Report"),
+]
+
+def _build_compound_sub_queries(messages: List[Dict[str, str]], base_keywords: List[str]) -> List[str]:
+    """
+    If the latest user message mentions multiple assessment categories explicitly,
+    return one targeted sub-query per category so retrieval covers all of them.
+    Returns an empty list when no compound pattern is detected (caller uses base query only).
+    """
+    last_user = next(
+        (m.get("content", "").lower() for m in reversed(messages) if m.get("role") == "user"), ""
+    )
+    sub_queries: List[str] = []
+    seen: set = set()
+    for signal, sub_q in _COMPOUND_CATEGORY_SIGNALS:
+        if signal in last_user and sub_q not in seen:
+            # Enrich with seniority / role context from base keywords
+            role_context = " ".join(
+                kw for kw in base_keywords
+                if kw.lower() not in ("cognitive", "personality", "situational", "sjt", "simulation")
+            )
+            enriched = f"{sub_q} {role_context}".strip()
+            sub_queries.append(enriched)
+            seen.add(sub_q)
+    return sub_queries
+# ──────────────────────────────────────────────────────────────────────────────
+
 # ── Main agent class ───────────────────────────────────────────────────────────
 class SHLAgent:
     """
@@ -522,8 +677,59 @@ class SHLAgent:
 
     # ── Node 1: Intent classifier ──────────────────────────────────────────────
     def _input_classifier(self, state: AgentState) -> AgentState:
+        messages = state["messages"]
+
+        # ── BUG 1 FIX: JD Dump guard ──────────────────────────────────────────
+        # If the latest user message lists 5+ distinct technical skills, force
+        # a 'vague' classification so we ask for priority before recommending.
+        if _is_jd_dump(messages):
+            prior_json = _extract_prior_recommendations_json(messages)
+            print("[INFO] JD-dump detected — forcing 'vague' to ask prioritisation question.")
+            result = ClassifierOutput(
+                intent="vague",
+                keywords=[],
+                draft_reply=(
+                    "The user pasted a JD with 5+ distinct skill areas. "
+                    "Ask which skills are day-one priorities before building the battery."
+                ),
+                prior_recommendations_json=prior_json,
+            )
+            return {
+                **state,
+                "classified_info": result.model_dump(),
+                "retrieved_docs": [],
+                "language_clarification_needed": False,
+            }
+
+        # ── BUG 3 FIX: CXO / Executive seniority heuristic ───────────────────
+        # If the user mentions a C-suite title and no shortlist exists yet,
+        # bypass skill clarification and directly search for leadership assessments.
+        if _is_cxo_query(messages):
+            prior_json = _extract_prior_recommendations_json(messages)
+            # Only intercept on the first search turn (no prior shortlist yet)
+            has_prior = prior_json != "[]" and prior_json.strip() not in ("[]", "")
+            if not has_prior:
+                print("[INFO] CXO query detected — injecting leadership keyword set.")
+                result = ClassifierOutput(
+                    intent="search",
+                    keywords=_CXO_KEYWORDS,
+                    draft_reply=(
+                        "C-suite / executive role detected. "
+                        "Retrieve OPQ32r, OPQ Leadership Report, OPQ UCR 2.0. "
+                        "Do NOT ask for skill clarification."
+                    ),
+                    prior_recommendations_json=prior_json,
+                )
+                return {
+                    **state,
+                    "classified_info": result.model_dump(),
+                    "retrieved_docs": [],
+                    "language_clarification_needed": False,
+                }
+
+        # ── Standard LLM-based classification ─────────────────────────────────
         lc_messages = [SystemMessage(content=CLASSIFIER_SYSTEM_PROMPT)]
-        for msg in state["messages"]:
+        for msg in messages:
             role, content = msg.get("role", "user"), msg.get("content", "")
             lc_messages.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
         try:
@@ -536,9 +742,18 @@ class SHLAgent:
                 draft_reply="Classification failed — asking for clarification.",
                 prior_recommendations_json="[]",
             )
+
+        # ── BUG 2 FIX: authoritative Python-layer prior shortlist extraction ──
+        # Override whatever the LLM extracted with a deterministic scan of the
+        # conversation history so compare / out_of_scope turns always have the
+        # correct prior shortlist available for re-emission.
+        authoritative_prior = _extract_prior_recommendations_json(messages)
+        patched = result.model_dump()
+        patched["prior_recommendations_json"] = authoritative_prior
+
         return {
             **state,
-            "classified_info": result.model_dump(),
+            "classified_info": patched,
             "retrieved_docs": [],
             "language_clarification_needed": False,
         }
@@ -562,6 +777,11 @@ class SHLAgent:
         seen_queries: set = set()
         # Base queries: keyword string + raw user message
         candidate_queries = [query, last_user_msg]
+        # BUG 4 FIX: add per-category sub-queries for compound requests
+        compound_sub_qs = _build_compound_sub_queries(state["messages"], keywords)
+        if compound_sub_qs:
+            print(f"[INFO] Compound query detected — adding {len(compound_sub_qs)} sub-queries.")
+            candidate_queries.extend(compound_sub_qs)
         # When hybrid route confirmed, add a dedicated personality retrieval query
         hybrid_q = _hybrid_personality_query(state["messages"])
         if hybrid_q:
@@ -706,14 +926,19 @@ class SHLAgent:
         if len(safe_recs) < len(result.recommendations):
             print(f"[WARN] Dropped {len(result.recommendations) - len(safe_recs)} item(s) with invalid URLs.")
 
-        # On compare / out_of_scope turns with empty recs → restore prior shortlist
+        # BUG 2 FIX: On compare / out_of_scope turns restore the prior shortlist.
+        # prior_json is now populated by the deterministic Python extractor so this
+        # path is reliable even when the LLM classifier failed to extract it.
         if intent in ("compare", "out_of_scope") and not safe_recs:
             try:
                 prior_items = json.loads(prior_json)
                 if isinstance(prior_items, list) and prior_items:
                     safe_recs = [AssessmentItem(**item) for item in prior_items]
-            except Exception:
-                pass
+                    print(f"[INFO] Restored {len(safe_recs)} prior shortlist item(s) for intent='{intent}'.")
+                else:
+                    print(f"[INFO] No prior shortlist to restore for intent='{intent}'.")
+            except Exception as exc:
+                print(f"[WARN] Could not restore prior shortlist: {exc}")
 
         # If language clarification is needed, force empty recommendations
         if lang_flag:
