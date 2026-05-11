@@ -1,9 +1,10 @@
+fastapi
+uvicorn
+langgraph
+langchain-groq
+chromadb
+pydantic
+python-dotenv
 requests
 torch
-chromadb
 transformers
-dotenv
-pydantic 
-langgraph.graph
-langchain.tools
-langchain_groq
