@@ -564,13 +564,23 @@ def _hybrid_personality_query(messages: List[Dict[str, str]]) -> str | None:
 # ──────────────────────────────────────────────────────────────────────────────
 
 # ── BUG 2 FIX: Deterministic prior shortlist extractor ────────────────────────
-# The LLM-based classifier sometimes fails to extract the prior shortlist from
-# conversation history (it returns "[]" when it should carry forward items).
-# This function provides a reliable Python-layer fallback that scans all
-# assistant messages for embedded JSON arrays of AssessmentItems.
+# DESIGN:
+#   The API response has both `reply` (str) and `recommendations` (list).
+#   Clients echo back only the `reply` text as the assistant's `content` field.
+#   So we EMBED the shortlist as a hidden machine-readable footer in the reply text:
+#       \n\n<!--RECS:[ ... JSON ... ]-->
+#   This footer is invisible to end-users but is reliably extractable here.
+#   The generator system prompt is also told to ignore the footer.
 
 import re as _re
 
+# Primary pattern: our own hidden footer (most reliable)
+_FOOTER_PATTERN = _re.compile(
+    r'<!--RECS:(\[.*?\])-->',
+    _re.DOTALL,
+)
+
+# Legacy / fallback patterns for messages without the footer
 _RECS_JSON_PATTERN = _re.compile(
     r'"recommendations"\s*:\s*(\[.*?\])',
     _re.DOTALL,
@@ -580,11 +590,45 @@ _BARE_ARRAY_PATTERN = _re.compile(
     _re.DOTALL,
 )
 
+# Sentinel used to embed / strip the footer
+_RECS_FOOTER_PREFIX = "\n\n<!--RECS:"
+_RECS_FOOTER_SUFFIX = "-->"
+
+
+def _embed_recs_footer(reply_text: str, recommendations: List[Dict[str, Any]]) -> str:
+    """
+    Append a hidden machine-readable footer to the reply text so that
+    future turns can reliably extract the most-recent shortlist from the
+    assistant message content alone, without relying on the LLM.
+    Only appended when recommendations is non-empty.
+    """
+    if not recommendations:
+        return reply_text
+    try:
+        recs_json = json.dumps(recommendations, separators=(",", ":"))
+        return f"{reply_text}{_RECS_FOOTER_PREFIX}{recs_json}{_RECS_FOOTER_SUFFIX}"
+    except Exception:
+        return reply_text
+
+
+def _strip_recs_footer(text: str) -> str:
+    """Remove the hidden footer before presenting the reply to the user."""
+    idx = text.find(_RECS_FOOTER_PREFIX)
+    if idx != -1:
+        return text[:idx]
+    return text
+
 
 def _extract_prior_recommendations_json(messages: List[Dict[str, str]]) -> str:
     """
     Scan assistant messages in reverse-chronological order and return the JSON
     string of the most recent non-empty recommendations array found.
+
+    Priority:
+      1. Hidden <!--RECS:[...]-->  footer  (injected by _embed_recs_footer)
+      2. "recommendations": [...]  block   (legacy / LLM-generated JSON responses)
+      3. Bare JSON array with name+url     (last-resort heuristic)
+
     Returns '[]' when nothing is found.
     """
     for msg in reversed(messages):
@@ -592,8 +636,8 @@ def _extract_prior_recommendations_json(messages: List[Dict[str, str]]) -> str:
             continue
         content = msg.get("content", "")
 
-        # Try to find a "recommendations": [...] block first
-        m = _RECS_JSON_PATTERN.search(content)
+        # 1. Hidden footer — most reliable
+        m = _FOOTER_PATTERN.search(content)
         if m:
             candidate = m.group(1).strip()
             try:
@@ -603,10 +647,21 @@ def _extract_prior_recommendations_json(messages: List[Dict[str, str]]) -> str:
             except json.JSONDecodeError:
                 pass
 
-        # Fallback: look for a bare JSON array with name+url keys
-        m2 = _BARE_ARRAY_PATTERN.search(content)
+        # 2. "recommendations": [...] key  (e.g. if client echoes raw JSON)
+        m2 = _RECS_JSON_PATTERN.search(content)
         if m2:
             candidate = m2.group(1).strip()
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, list) and parsed:
+                    return json.dumps(parsed)
+            except json.JSONDecodeError:
+                pass
+
+        # 3. Bare JSON array with name+url
+        m3 = _BARE_ARRAY_PATTERN.search(content)
+        if m3:
+            candidate = m3.group(1).strip()
             try:
                 parsed = json.loads(candidate)
                 if isinstance(parsed, list) and parsed:
@@ -909,6 +964,9 @@ class SHLAgent:
         lc_messages = [SystemMessage(content=full_system)]
         for msg in state["messages"]:
             role, content = msg.get("role", "user"), msg.get("content", "")
+            # Strip hidden footer from assistant messages so the LLM sees clean text
+            if role == "assistant":
+                content = _strip_recs_footer(content)
             lc_messages.append(HumanMessage(content=content) if role == "user" else AIMessage(content=content))
 
         try:
@@ -926,26 +984,49 @@ class SHLAgent:
         if len(safe_recs) < len(result.recommendations):
             print(f"[WARN] Dropped {len(result.recommendations) - len(safe_recs)} item(s) with invalid URLs.")
 
-        # BUG 2 FIX: On compare / out_of_scope turns restore the prior shortlist.
-        # prior_json is now populated by the deterministic Python extractor so this
-        # path is reliable even when the LLM classifier failed to extract it.
-        if intent in ("compare", "out_of_scope") and not safe_recs:
+        # ── STATE-PRESERVATION FIX ─────────────────────────────────────────────
+        # For purely informational turns (compare, out_of_scope, clarify_test),
+        # the prior shortlist MUST be preserved unconditionally.
+        # We ALWAYS restore from the deterministic Python extractor on these intents —
+        # this overwrites whatever the LLM produced (often [] by mistake).
+        CARRY_OVER_INTENTS = {"compare", "out_of_scope", "clarify_test"}
+        if intent in CARRY_OVER_INTENTS:
             try:
                 prior_items = json.loads(prior_json)
                 if isinstance(prior_items, list) and prior_items:
-                    safe_recs = [AssessmentItem(**item) for item in prior_items]
-                    print(f"[INFO] Restored {len(safe_recs)} prior shortlist item(s) for intent='{intent}'.")
+                    restored: List[AssessmentItem] = []
+                    for item in prior_items:
+                        try:
+                            restored.append(AssessmentItem(**item))
+                        except Exception:
+                            pass   # skip malformed entries silently
+                    safe_recs = restored
+                    print(
+                        f"[INFO] Carry-over: restored {len(safe_recs)} shortlist item(s) "
+                        f"for intent='{intent}'."
+                    )
                 else:
+                    safe_recs = []   # no prior yet — return empty as expected
                     print(f"[INFO] No prior shortlist to restore for intent='{intent}'.")
             except Exception as exc:
-                print(f"[WARN] Could not restore prior shortlist: {exc}")
+                print(f"[WARN] Could not restore prior shortlist for intent='{intent}': {exc}")
+                safe_recs = []
 
         # If language clarification is needed, force empty recommendations
         if lang_flag:
             safe_recs = []
 
+        # ── Embed hidden footer so future turns can extract the shortlist ──────
+        # The footer <!--RECS:[...]-->  is appended to the reply text and stripped
+        # at the API boundary before returning to the client.  This is the
+        # authoritative source for _extract_prior_recommendations_json.
+        reply_with_footer = _embed_recs_footer(
+            result.reply,
+            [r.model_dump() for r in safe_recs],
+        )
+
         final = FinalOutput(
-            reply=result.reply,
+            reply=reply_with_footer,    # footer stripped at API layer
             recommendations=safe_recs,
             end_of_conversation=result.end_of_conversation,
         )
@@ -1040,6 +1121,10 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         raise HTTPException(status_code=500, detail="Internal error. Please retry.")
 
     try:
+        # Strip the hidden <!--RECS:...-->  footer from the reply before returning
+        # to the client.  The footer is only used internally by _extract_prior_recommendations_json
+        # so the conversation history can carry shortlists across turns without relying on the LLM.
+        response_dict["reply"] = _strip_recs_footer(response_dict.get("reply", ""))
         return ChatResponse(**response_dict)
     except Exception:
         return ChatResponse(
