@@ -940,13 +940,27 @@ class SHLAgent:
         if len(safe_recs) < len(result.recommendations):
             print(f"[WARN] Dropped {len(result.recommendations) - len(safe_recs)} item(s) with invalid URLs.")
 
-        # ── STATE-PRESERVATION FIX ─────────────────────────────────────────────
-        # For purely informational turns (compare, out_of_scope, clarify_test),
-        # the prior shortlist MUST be preserved unconditionally.
-        # We ALWAYS restore from the deterministic Python extractor on these intents —
-        # this overwrites whatever the LLM produced (often [] by mistake).
+        # ── STATE-PRESERVATION FIX (Amnesia Guard) ────────────────────────────
+        # Two conditions that require the prior shortlist to be restored:
+        #
+        #   A) INTENT_DEMANDS_CARRYOVER — informational turns where the shortlist
+        #      must survive unconditionally (compare, out_of_scope, clarify_test).
+        #
+        #   B) MISTAKEN_EMPTY_SEARCH — the LLM misclassified a compare/OOS turn
+        #      as 'search' (common: "what's the difference between X and Y?" or
+        #      "are we GDPR compliant?").  The generator produced [] because it
+        #      was focused on answering the question, not re-emitting the shortlist.
+        #      Guard: only trigger when there IS a prior shortlist to restore —
+        #      a genuine first-turn search that returns [] should stay [].
         CARRY_OVER_INTENTS = {"compare", "out_of_scope", "clarify_test"}
-        if intent in CARRY_OVER_INTENTS:
+        INTENT_DEMANDS_CARRYOVER = intent in CARRY_OVER_INTENTS
+        MISTAKEN_EMPTY_SEARCH = (
+            len(safe_recs) == 0
+            and intent == "search"
+            and prior_json not in ("[]", "", "null")
+        )
+
+        if INTENT_DEMANDS_CARRYOVER or MISTAKEN_EMPTY_SEARCH:
             try:
                 prior_items = json.loads(prior_json)
                 if isinstance(prior_items, list) and prior_items:
@@ -956,17 +970,27 @@ class SHLAgent:
                             restored.append(AssessmentItem(**item))
                         except Exception:
                             pass   # skip malformed entries silently
-                    safe_recs = restored
-                    print(
-                        f"[INFO] Carry-over: restored {len(safe_recs)} shortlist item(s) "
-                        f"for intent='{intent}'."
-                    )
+                    if restored:
+                        safe_recs = restored
+                        trigger = "intent" if INTENT_DEMANDS_CARRYOVER else "mistaken-empty-search"
+                        print(
+                            f"[INFO] Amnesia Guard ({trigger}): restored {len(safe_recs)} "
+                            f"shortlist item(s) for intent='{intent}'."
+                        )
+                    else:
+                        # prior_json parsed but yielded no valid items
+                        if INTENT_DEMANDS_CARRYOVER:
+                            safe_recs = []
+                        print(f"[INFO] Amnesia Guard: prior_json parsed but empty for intent='{intent}'.")
                 else:
-                    safe_recs = []   # no prior yet — return empty as expected
-                    print(f"[INFO] No prior shortlist to restore for intent='{intent}'.")
+                    # No prior shortlist yet — this is a genuine first-turn with no history
+                    if INTENT_DEMANDS_CARRYOVER:
+                        safe_recs = []
+                    print(f"[INFO] Amnesia Guard: no prior shortlist to restore for intent='{intent}'.")
             except Exception as exc:
-                print(f"[WARN] Could not restore prior shortlist for intent='{intent}': {exc}")
-                safe_recs = []
+                print(f"[WARN] Amnesia Guard: could not restore prior shortlist for intent='{intent}': {exc}")
+                if INTENT_DEMANDS_CARRYOVER:
+                    safe_recs = []
 
         # If language clarification is needed, force empty recommendations
         if lang_flag:
