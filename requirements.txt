@@ -1,0 +1,9 @@
+requests
+torch
+chromadb
+transformers
+dotenv
+pydantic 
+langgraph.graph
+langchain.tools
+langchain_groq
