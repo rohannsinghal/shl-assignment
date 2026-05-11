@@ -3,6 +3,7 @@ uvicorn
 langgraph
 langchain-groq
 langchain-community
+langchain-huggingface
 chromadb
 pydantic
 python-dotenv

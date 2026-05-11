@@ -19,7 +19,7 @@ import json
 import os
 from typing import Any, Dict, List, Literal
 import chromadb
-from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
+from langchain_huggingface import HuggingFaceEndpointEmbeddings
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -36,12 +36,15 @@ tenant = os.environ.get("CHROMA_TENANT")
 database = os.environ.get("CHROMA_DATABASE")
 chroma_api_key = os.environ.get("CHROMA_API_KEY")
 
-# embedding model (via HuggingFace Inference API — no local model weights)
+# embedding model via HuggingFace Inference API (no local model weights)
+# Uses HuggingFaceEndpointEmbeddings — the current, non-deprecated API class.
+# bge-base-en-v1.5 is served at the dedicated HF feature-extraction endpoint.
 EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
+HF_INFERENCE_URL = f"https://api-inference.huggingface.co/pipeline/feature-extraction/BAAI/bge-base-en-v1.5"
 hf_token = os.environ.get("HF_TOKEN")
-inference_embeddings = HuggingFaceInferenceAPIEmbeddings(
-    api_key=hf_token,
-    model_name=EMBEDDING_MODEL,
+inference_embeddings = HuggingFaceEndpointEmbeddings(
+    model=HF_INFERENCE_URL,
+    huggingfacehub_api_token=hf_token,
 )
 
 # ── FIX 1: canonical short-code mapping ───────────────────────────────────────
