@@ -19,9 +19,7 @@ import json
 import os
 from typing import Any, Dict, List, Literal
 import chromadb
-import torch
-import torch.nn.functional as F
-from transformers import AutoModel, AutoTokenizer
+from langchain_community.embeddings import HuggingFaceInferenceAPIEmbeddings
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -38,8 +36,13 @@ tenant = os.environ.get("CHROMA_TENANT")
 database = os.environ.get("CHROMA_DATABASE")
 chroma_api_key = os.environ.get("CHROMA_API_KEY")
 
-# embedding model
+# embedding model (via HuggingFace Inference API — no local model weights)
 EMBEDDING_MODEL = "BAAI/bge-base-en-v1.5"
+hf_token = os.environ.get("HF_TOKEN")
+inference_embeddings = HuggingFaceInferenceAPIEmbeddings(
+    api_key=hf_token,
+    model_name=EMBEDDING_MODEL,
+)
 
 # ── FIX 1: canonical short-code mapping ───────────────────────────────────────
 KEYS_TO_CODE: Dict[str, str] = {
@@ -446,24 +449,9 @@ def _build_chroma_collection() -> chromadb.Collection:
     )
     return client.get_collection("product_catalog")
 
-def _get_device() -> torch.device:
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
-
-def _mean_pool(token_embeddings: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
-    return torch.sum(token_embeddings * mask_expanded, dim=1) / torch.clamp(
-        mask_expanded.sum(dim=1), min=1e-9
-    )
-
-def _embed_query(query: str, tokenizer: AutoTokenizer, model: AutoModel, device: torch.device) -> List[float]:
-    encoded = tokenizer([query], padding=True, truncation=True, max_length=512, return_tensors="pt")
-    encoded = {k: v.to(device) for k, v in encoded.items()}
-    with torch.no_grad():
-        outputs = model(**encoded)
-    pooled = _mean_pool(outputs.last_hidden_state, encoded["attention_mask"])
-    return F.normalize(pooled, p=2, dim=1).cpu().tolist()[0]
+def _embed_query(query: str) -> List[float]:
+    """Embed a query string via the HuggingFace Inference API (zero local RAM)."""
+    return inference_embeddings.embed_query(query)
 
 # ── FIX 4: Sales re-skilling keyword expansion ─────────────────────────────────
 SALES_EXPANSION_KEYWORDS = [
@@ -530,10 +518,6 @@ class SHLAgent:
         self._classifier_chain = self._llm.with_structured_output(ClassifierOutput)
         self._generator_chain  = self._llm.with_structured_output(FinalOutput)
         self._collection = _build_chroma_collection()
-        self._embed_device = _get_device()
-        self._tokenizer   = AutoTokenizer.from_pretrained(EMBEDDING_MODEL)
-        self._embed_model = AutoModel.from_pretrained(EMBEDDING_MODEL).to(self._embed_device)
-        self._embed_model.eval()
         self._graph = self._build_graph()
 
     # ── Node 1: Intent classifier ──────────────────────────────────────────────
@@ -593,7 +577,7 @@ class SHLAgent:
 
         try:
             for q in queries_to_run:
-                query_vector = _embed_query(q, self._tokenizer, self._embed_model, self._embed_device)
+                query_vector = _embed_query(q)
                 results = self._collection.query(
                     query_embeddings=[query_vector],
                     n_results=10,
